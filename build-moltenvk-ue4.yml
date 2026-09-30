@@ -1,0 +1,91 @@
+name: Build MoltenVK 1.4.2 UE4 workaround
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-moltenvk:
+    name: Build patched macOS library
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+
+    steps:
+      - name: Show runner toolchain
+        run: |
+          uname -a
+          xcode-select -p
+          xcodebuild -version
+          python3 --version
+          cmake --version
+
+      - name: Clone MoltenVK v1.4.2
+        run: git clone --depth 1 --branch v1.4.2 https://github.com/KhronosGroup/MoltenVK.git MoltenVK
+
+      - name: Fetch macOS dependencies
+        working-directory: MoltenVK
+        run: ./fetchDependencies --macos
+
+      - name: Apply the UE4 shader workaround
+        working-directory: MoltenVK
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path("MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp")
+          contents = source.read_text()
+          anchor = "conversionResult.msl = pMSLCompiler->compile();"
+          if contents.count(anchor) != 1:
+              raise SystemExit(f"Expected exactly one source anchor in {source}; found {contents.count(anchor)}")
+
+          anchor_line = next(line for line in contents.splitlines() if anchor in line)
+          indent = anchor_line[: len(anchor_line) - len(anchor_line.lstrip())]
+          workaround_lines = [
+              "std::string::size_type pos = 0u;",
+              'std::string str_find = "t3.sample(s3, r0.yzwy.xyz).xyz";',
+              'std::string str_replace = "r0.yzw";',
+              "while ((pos = conversionResult.msl.find(str_find, pos)) != std::string::npos)",
+              "{",
+              "    conversionResult.msl.replace(pos, str_find.length(), str_replace);",
+              "    pos += str_replace.length();",
+              "}",
+          ]
+          workaround = "\n\n" + indent + ("\n" + indent).join(workaround_lines)
+          source.write_text(contents.replace(anchor, anchor + workaround, 1))
+          patched = source.read_text()
+          expected_start = anchor + "\n\n" + indent + workaround_lines[0]
+          if patched.count(expected_start) != 1:
+              raise SystemExit("The requested workaround was not inserted exactly once")
+          patched_lines = patched.splitlines()
+          anchor_index = next(index for index, line in enumerate(patched_lines) if anchor in line)
+          if patched_lines[anchor_index + 1] != "" or patched_lines[anchor_index + 2].strip() != workaround_lines[0]:
+              raise SystemExit("The compile assignment is not separated from the workaround by a blank line")
+          print("Patched source context:")
+          print("\n".join(patched_lines[max(0, anchor_index - 2):anchor_index + len(workaround_lines) + 3]))
+          print(f"Inserted only the UE4 shader workaround in {source}")
+          PY
+
+      - name: Build MoltenVK for macOS
+        working-directory: MoltenVK
+        run: make macos
+
+      - name: Inspect the built library
+        working-directory: MoltenVK
+        shell: bash
+        run: |
+          library="Package/Latest/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib"
+          test -f "$library"
+          file "$library"
+          lipo -archs "$library"
+          lipo -archs "$library" | grep -qw x86_64
+          shasum -a 256 "$library"
+
+      - name: Upload patched MoltenVK library
+        uses: actions/upload-artifact@v4
+        with:
+          name: MoltenVK-1.4.2-UE4-workaround
+          path: MoltenVK/Package/Latest/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib
+          if-no-files-found: error
+          retention-days: 30
